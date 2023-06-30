@@ -1,0 +1,12 @@
+[package]
+name = "crate-deps"
+version = "0.1.0"
+authors = ["Christian Sharpsten <christian.sharpsten@gmail.com>"]
+edition = "2021"
+description = "Compute a rust crate's dependency tree"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.71"
+cargo = "0.71.0"
+thiserror = "1.0.40"
