@@ -13,16 +13,25 @@ use cargo::core::package_id::PackageId;
 use cargo::core::registry::{PackageRegistry, Registry};
 use cargo::core::resolver::features::RequestedFeatures;
 use cargo::core::resolver::{self, CliFeatures, ResolveOpts, VersionOrdering, VersionPreferences};
-use cargo::core::source::SourceId;
 use cargo::core::summary::Summary;
-use cargo::core::{Dependency, FeatureValue, QueryKind};
+use cargo::core::SourceId;
+use cargo::core::{Dependency, FeatureValue};
+use cargo::sources::source::QueryKind;
+use cargo::sources::IndexSummary;
+use cargo::util::cache_lock::CacheLockMode;
 use cargo::util::config::Config;
 use cargo::util::interning::InternedString;
 use cargo::util::OptVersionReq;
 use thiserror::Error;
 
 const DUMMY_PACKAGE_NAME: &str = "dummy-pkg";
-const DUMMY_PACKAGE_VERSION: &str = "0.1.0";
+const DUMMY_PACKAGE_VERSION: semver::Version = semver::Version {
+    major: 0,
+    minor: 1,
+    patch: 0,
+    pre: semver::Prerelease::EMPTY,
+    build: semver::BuildMetadata::EMPTY,
+};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -78,12 +87,14 @@ impl Resolver {
 
         // Get a full summary for the package in question so we can enumerate its
         // features.
-        let _lock = self.config.acquire_package_cache_lock()?;
+        let _lock = self
+            .config
+            .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
         let summary = get_package_summary(&mut *self.registry, &dep)?;
 
         // First get a list of all dependencies required if no features are enabled.
         query_dependencies(
-            &*self.config,
+            &self.config,
             self.source,
             &mut *self.registry,
             &dep,
@@ -104,7 +115,7 @@ impl Resolver {
                 let mut dep = dep.clone();
                 dep.set_features([*feature]);
                 query_dependencies(
-                    &*self.config,
+                    &self.config,
                     self.source,
                     &mut *self.registry,
                     &dep,
@@ -148,7 +159,9 @@ fn get_package_summary<R: Registry>(registry: &mut R, dep: &Dependency) -> Resul
     let mut summaries = Vec::new();
     loop {
         if registry
-            .query(dep, QueryKind::Exact, &mut |s: Summary| summaries.push(s))
+            .query(dep, QueryKind::Exact, &mut |s: IndexSummary| {
+                summaries.push(s.into_summary())
+            })
             .is_ready()
         {
             break;
@@ -163,15 +176,13 @@ fn get_package_summary<R: Registry>(registry: &mut R, dep: &Dependency) -> Resul
                 OptVersionReq::Any => None,
                 OptVersionReq::Req(vr) => Some(vr.to_string()),
                 OptVersionReq::Locked(v, _) => Some(v.to_string()),
+                OptVersionReq::UpdatePrecise(v, _) => Some(v.to_string()),
             },
         });
     }
 
-    VersionPreferences::default().sort_summaries(
-        &mut summaries,
-        VersionOrdering::MaximumVersionsFirst,
-        false,
-    );
+    VersionPreferences::default()
+        .sort_summaries(&mut summaries, Some(VersionOrdering::MaximumVersionsFirst));
 
     Ok(summaries.into_iter().next().unwrap())
 }
@@ -183,12 +194,17 @@ fn query_dependencies<R: Registry>(
     dep: &Dependency,
     all_deps: &mut HashSet<Package>,
 ) -> Result<()> {
+    let pkg_id = PackageId::new(
+        InternedString::new(DUMMY_PACKAGE_NAME),
+        DUMMY_PACKAGE_VERSION,
+        source,
+    );
     let summary = Summary::new(
-        config,
-        PackageId::new(DUMMY_PACKAGE_NAME, DUMMY_PACKAGE_VERSION, source)?,
+        pkg_id,
         vec![dep.clone()],
         &BTreeMap::new(),
         None::<InternedString>,
+        None,
     )?;
     let resolve_opts: ResolveOpts = ResolveOpts::new(
         true,
@@ -201,8 +217,7 @@ fn query_dependencies<R: Registry>(
         &[],
         registry,
         &version_prefs,
-        Some(&config),
-        false,
+        Some(config),
     )?;
 
     all_deps.extend(result.iter().map(|p| Package {
