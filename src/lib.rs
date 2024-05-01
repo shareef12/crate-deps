@@ -1,9 +1,12 @@
+#![doc = include_str!("../README.md")]
+
 // TODO
 //  * Use a local registry index
 //  * Should we be specifying a config (it determines where warnings are printed)?
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::mem::ManuallyDrop;
 
 use anyhow::Error as CargoError;
 use cargo::core::package_id::PackageId;
@@ -34,52 +37,111 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A package dependency.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Package {
     pub name: String,
     pub version: String,
 }
 
-pub fn dependencies(package: &str, version: Option<&str>) -> Result<HashSet<Package>> {
-    let config = Config::default()?;
-    let _lock = config.acquire_package_cache_lock()?;
+/// A package dependency resolver.
+pub struct Resolver {
+    config: ManuallyDrop<Box<Config>>,
+    registry: ManuallyDrop<PackageRegistry<'static>>,
+    source: SourceId,
+}
 
-    let source = SourceId::crates_io(&config)?;
-    let mut registry = PackageRegistry::new(&config)?;
-    registry.lock_patches();
-
-    // Get a full summary for the package in question so we can enumerate its
-    // features.
-    let dep = Dependency::parse(package, version, source)?;
-    let summary = get_package_summary(&mut registry, &dep)?;
-
-    // First get a list of all dependencies required if no features are enabled.
-    let mut all_deps = HashSet::new();
-    query_dependencies(&config, source, &mut registry, &dep, &mut all_deps)?;
-
-    // Try to incrementally enable every feature that may activate an optional
-    // dependency, and merge the dependency requirements with our original
-    // list. We don't toggle all features at once in case a package declares
-    // conflicting features.
-    for (feature, fv) in summary.features() {
-        if fv.iter().any(|fv| {
-            matches!(
-                fv,
-                FeatureValue::Dep { .. } | FeatureValue::DepFeature { .. }
-            )
-        }) {
-            let mut dep = dep.clone();
-            dep.set_features([*feature]);
-            query_dependencies(&config, source, &mut registry, &dep, &mut all_deps)?;
-        }
+impl Resolver {
+    /// Create a new package dependency resolver using the current Cargo config
+    /// and the crates.io index.
+    pub fn new() -> Result<Self> {
+        let config = Box::new(Config::default()?);
+        let source = SourceId::crates_io(&config)?;
+        let mut registry = PackageRegistry::new(unsafe { std::mem::transmute(&*config) })?;
+        registry.lock_patches();
+        Ok(Self {
+            config: ManuallyDrop::new(config),
+            registry: ManuallyDrop::new(registry),
+            source,
+        })
     }
 
-    all_deps.remove(&Package {
-        name: DUMMY_PACKAGE_NAME.to_string(),
-        version: DUMMY_PACKAGE_VERSION.to_string(),
-    });
+    /// Get the dependencies for a single package, merging them into the
+    /// specified `dependencies` set.
+    pub fn merge_dependencies(
+        &mut self,
+        package: &str,
+        version: Option<&str>,
+        dependencies: &mut HashSet<Package>,
+    ) -> Result<()> {
+        let dep = Dependency::parse(package, version, self.source)?;
 
-    Ok(all_deps)
+        // Get a full summary for the package in question so we can enumerate its
+        // features.
+        let _lock = self.config.acquire_package_cache_lock()?;
+        let summary = get_package_summary(&mut *self.registry, &dep)?;
+
+        // First get a list of all dependencies required if no features are enabled.
+        query_dependencies(
+            &*self.config,
+            self.source,
+            &mut *self.registry,
+            &dep,
+            dependencies,
+        )?;
+
+        // Try to incrementally enable every feature that may activate an optional
+        // dependency, and merge the dependency requirements with our original
+        // list. We don't toggle all features at once in case a package declares
+        // conflicting features.
+        for (feature, fv) in summary.features() {
+            if fv.iter().any(|fv| {
+                matches!(
+                    fv,
+                    FeatureValue::Dep { .. } | FeatureValue::DepFeature { .. }
+                )
+            }) {
+                let mut dep = dep.clone();
+                dep.set_features([*feature]);
+                query_dependencies(
+                    &*self.config,
+                    self.source,
+                    &mut *self.registry,
+                    &dep,
+                    dependencies,
+                )?;
+            }
+        }
+
+        dependencies.remove(&Package {
+            name: DUMMY_PACKAGE_NAME.to_string(),
+            version: DUMMY_PACKAGE_VERSION.to_string(),
+        });
+
+        Ok(())
+    }
+
+    /// Get the dependencies for a single package.
+    pub fn dependencies(
+        &mut self,
+        package: &str,
+        version: Option<&str>,
+    ) -> Result<HashSet<Package>> {
+        let mut dependencies = HashSet::new();
+        self.merge_dependencies(package, version, &mut dependencies)?;
+        Ok(dependencies)
+    }
+}
+
+impl Drop for Resolver {
+    fn drop(&mut self) {
+        // The `registry` field holds a reference to `config`. Ensure
+        // `registry` is dropped first.
+        unsafe {
+            ManuallyDrop::drop(&mut self.registry);
+            ManuallyDrop::drop(&mut self.config);
+        }
+    }
 }
 
 fn get_package_summary<R: Registry>(registry: &mut R, dep: &Dependency) -> Result<Summary> {
@@ -157,19 +219,22 @@ mod tests {
 
     #[test]
     fn serde_with_version() {
-        let deps = dependencies("serde", Some("1.0.164")).unwrap();
-        eprintln!("{:#?}", deps);
+        let mut resolver = Resolver::new().unwrap();
+        let deps = resolver.dependencies("serde", Some("1.0.164")).unwrap();
+        eprintln!("{deps:#?}");
     }
 
     #[test]
     fn serde_without_version() {
-        let deps = dependencies("serde", None).unwrap();
-        eprintln!("{:#?}", deps);
+        let mut resolver = Resolver::new().unwrap();
+        let deps = resolver.dependencies("serde", None).unwrap();
+        eprintln!("{deps:#?}");
     }
 
     #[test]
     fn cargo_without_version() {
-        let deps = dependencies("cargo", None).unwrap();
-        eprintln!("{:#?}", deps);
+        let mut resolver = Resolver::new().unwrap();
+        let deps = resolver.dependencies("cargo", None).unwrap();
+        eprintln!("{deps:#?}");
     }
 }
