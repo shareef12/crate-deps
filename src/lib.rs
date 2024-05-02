@@ -53,6 +53,13 @@ pub struct Package {
     pub version: String,
 }
 
+/// A feature that could not be toggled for dependency resolution.
+#[derive(Debug)]
+pub struct UnresolvedFeature {
+    pub name: String,
+    pub error: Error,
+}
+
 /// A package dependency resolver.
 pub struct Resolver {
     config: ManuallyDrop<Box<Config>>,
@@ -75,6 +82,17 @@ impl Resolver {
         })
     }
 
+    /// Get the dependencies for a single package.
+    pub fn dependencies(
+        &mut self,
+        package: &str,
+        version: Option<&str>,
+    ) -> Result<(HashSet<Package>, Vec<UnresolvedFeature>)> {
+        let mut dependencies = HashSet::new();
+        let unresolved_features = self.merge_dependencies(package, version, &mut dependencies)?;
+        Ok((dependencies, unresolved_features))
+    }
+
     /// Get the dependencies for a single package, merging them into the
     /// specified `dependencies` set.
     pub fn merge_dependencies(
@@ -82,7 +100,7 @@ impl Resolver {
         package: &str,
         version: Option<&str>,
         dependencies: &mut HashSet<Package>,
-    ) -> Result<()> {
+    ) -> Result<Vec<UnresolvedFeature>> {
         let dep = Dependency::parse(package, version, self.source)?;
 
         // Get a full summary for the package in question so we can enumerate its
@@ -105,6 +123,7 @@ impl Resolver {
         // dependency, and merge the dependency requirements with our original
         // list. We don't toggle all features at once in case a package declares
         // conflicting features.
+        let mut unresolved_features = Vec::new();
         for (feature, fv) in summary.features() {
             if fv.iter().any(|fv| {
                 matches!(
@@ -114,13 +133,18 @@ impl Resolver {
             }) {
                 let mut dep = dep.clone();
                 dep.set_features([*feature]);
-                query_dependencies(
+                if let Err(error) = query_dependencies(
                     &self.config,
                     self.source,
                     &mut *self.registry,
                     &dep,
                     dependencies,
-                )?;
+                ) {
+                    unresolved_features.push(UnresolvedFeature {
+                        name: feature.as_str().to_string(),
+                        error,
+                    });
+                }
             }
         }
 
@@ -129,18 +153,7 @@ impl Resolver {
             version: DUMMY_PACKAGE_VERSION.to_string(),
         });
 
-        Ok(())
-    }
-
-    /// Get the dependencies for a single package.
-    pub fn dependencies(
-        &mut self,
-        package: &str,
-        version: Option<&str>,
-    ) -> Result<HashSet<Package>> {
-        let mut dependencies = HashSet::new();
-        self.merge_dependencies(package, version, &mut dependencies)?;
-        Ok(dependencies)
+        Ok(unresolved_features)
     }
 }
 
@@ -233,23 +246,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serde_with_version() {
+    fn async_std_latest() {
         let mut resolver = Resolver::new().unwrap();
-        let deps = resolver.dependencies("serde", Some("1.0.164")).unwrap();
+        let (deps, errs) = resolver.dependencies("async-std", None).unwrap();
+        eprintln!("{deps:#?}");
+        eprintln!("{errs:#?}");
+    }
+
+    #[test]
+    fn cargo_latest() {
+        let mut resolver = Resolver::new().unwrap();
+        let (deps, errs) = resolver.dependencies("cargo", None).unwrap();
+        assert!(errs.is_empty());
         eprintln!("{deps:#?}");
     }
 
     #[test]
-    fn serde_without_version() {
+    fn serde_versioned() {
         let mut resolver = Resolver::new().unwrap();
-        let deps = resolver.dependencies("serde", None).unwrap();
+        let (deps, errs) = resolver.dependencies("serde", Some("1.0.164")).unwrap();
+        assert!(errs.is_empty());
         eprintln!("{deps:#?}");
     }
 
     #[test]
-    fn cargo_without_version() {
+    fn serde_latest() {
         let mut resolver = Resolver::new().unwrap();
-        let deps = resolver.dependencies("cargo", None).unwrap();
+        let (deps, errs) = resolver.dependencies("serde", None).unwrap();
+        assert!(errs.is_empty());
         eprintln!("{deps:#?}");
+        for err in errs {
+            println!(
+                "couldn't resolve dependencies with feature '{}': {:#}",
+                err.name, err.error
+            );
+        }
     }
 }
